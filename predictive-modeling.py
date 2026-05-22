@@ -35,6 +35,7 @@ from sklearn.inspection import permutation_importance
 import warnings
 import os
 import json
+import time
 from datetime import datetime
 from xgboost import XGBRegressor, XGBClassifier
 from lightgbm import LGBMRegressor, LGBMClassifier
@@ -274,10 +275,33 @@ def download_data(target_symbol, feature_symbols, period="5y"):
             all_symbols.append(es)
 
     print(f"\n  Downloading {len(all_symbols)} assets...")
-    raw = yf.download(all_symbols, period=period, interval="1d", progress=False)["Close"]
+    raw = None
+    for attempt in range(1, 4):
+        try:
+            result = yf.download(all_symbols, period=period, interval="1d", progress=False)
+            if result is None or result.empty:
+                print(f"  WARNING: yfinance returned no data on attempt {attempt}.")
+            else:
+                raw = result["Close"] if "Close" in result else result
+                break
+        except Exception as e:
+            msg = str(e)
+            print(f"  WARNING: Download attempt {attempt} failed: {msg}")
+            if attempt < 3:
+                time.sleep(1)
+                continue
+            return None, None, None
+
+    if raw is None or raw.empty:
+        print(f"  ERROR: No data downloaded for symbols: {all_symbols}")
+        return None, None, None
+
     if hasattr(raw.columns, 'levels'):
         raw.columns = raw.columns.get_level_values(0)
     raw = raw.dropna()
+    if raw.empty:
+        print(f"  ERROR: No data remains after dropna() for symbols: {all_symbols}")
+        return None, None, None
 
     for col in raw.columns:
         raw[col] = raw[col].astype(float)
