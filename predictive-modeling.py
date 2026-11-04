@@ -215,11 +215,17 @@ def get_user_selection():
         return "GC=F", PRESETS["1"]["features"]
 
 
-def auto_detect_features(target, period="2y", top_n=5):
+# The main model's test window is the last ~20% of its 5-year download, which starts
+# roughly 10 months before the last date. Auto-detect correlations stop 12 months back.
+AUTO_DETECT_CUTOFF_DAYS = 365
+
+
+def auto_detect_features(target, period="5y", top_n=5):
     """Automatically find top-N correlated assets for target.
 
-    v9 fix: Uses only the first 80% of data for correlation computation
-    to avoid look-ahead bias. Feature selection must never see test data.
+    Correlations use only returns before the main model's test window
+    (AUTO_DETECT_CUTOFF_DAYS before the last date), so feature selection
+    never sees test-period data.
     """
     print(f"\n  [AUTO-DETECT] Finding top {top_n} correlated assets for {target}...")
 
@@ -244,18 +250,16 @@ def auto_detect_features(target, period="2y", top_n=5):
         print(f"  ERROR: {target} not in returns")
         return ["^GSPC", "^VIX", "GC=F", "DX-Y.NYB"]
 
-    # v9: Use only the first 80% of data for correlation (train portion)
-    # to prevent look-ahead bias from leaking test-period information
-    # into feature selection
-    split_idx = int(len(returns) * 0.8)
-    train_returns = returns.iloc[:split_idx]
+    # Only use returns from before the main model's test window
+    cutoff = returns.index[-1] - pd.Timedelta(days=AUTO_DETECT_CUTOFF_DAYS)
+    train_returns = returns[returns.index < cutoff]
 
     # Lag-1 predictive correlation: "today's X predicts tomorrow's target"
     corr = train_returns.shift(1).corrwith(train_returns[target]).drop(target, errors='ignore')
     abs_corr = corr.abs().sort_values(ascending=False)
     top_features = abs_corr.head(top_n).index.tolist()
 
-    print(f"  Top {top_n} correlated (train-only, {split_idx} days):")
+    print(f"  Top {top_n} correlated (data before {cutoff.date()}, {len(train_returns)} days):")
     for i, s in enumerate(top_features):
         c = corr.get(s, 0)
         name = ASSET_CATALOG.get(s, s)
@@ -328,7 +332,8 @@ def download_data(target_symbol, feature_symbols, period="5y"):
 def engineer_features(data, target_col, feature_cols, mode="both"):
     """
     mode: 'regression', 'classification', or 'both'
-    Returns X, y_reg, y_cls, feat_cols, dates, regime_data
+    Returns X, y_reg, y_cls, feat_cols, dates, regime_data, latest
+    (latest = feature row for the most recent date, used for the next-day forecast)
 
     v8 fix: All features are now return/rate-based (stationary) instead of
     raw price levels. This prevents the model from learning spurious
@@ -415,6 +420,9 @@ def engineer_features(data, target_col, feature_cols, mode="both"):
         df["VIX_ma20"] = df["VIX"].rolling(20).mean()
         df["VIX_to_ma20"] = df["VIX"] / df["VIX_ma20"] - 1.0
 
+    # The last row has its features but no target yet (tomorrow's return is unknown).
+    # Keep it for the live next-day forecast and train only on complete rows.
+    df_all = df
     df = df.dropna()
 
     # Feature columns (exclude targets, raw prices, and regime columns)
@@ -445,8 +453,17 @@ def engineer_features(data, target_col, feature_cols, mode="both"):
     balance_warning = ""
     if cls_mean > 0.60 or cls_mean < 0.40:
         balance_warning = " ⚠️ IMBALANCED — class weights applied!"
+    # Feature row for the most recent date (no target needed): used for the next-day forecast
+    X_latest = df_all[feat_cols_final].iloc[-1].values.astype(float).reshape(1, -1)
+    X_latest = np.where(np.isinf(X_latest), np.nan, X_latest)
+    latest = {
+        "X": None if np.isnan(X_latest).any() else X_latest,
+        "dates": df_all.index[-21:],
+        "prices": df_all[target_col].values[-21:],
+    }
+
     print(f"  Features: {len(feat_cols_final)} | Samples: {len(df)} | Class balance: {cls_mean:.1%} up{balance_warning}")
-    return X, y_reg, y_cls, feat_cols_final, dates, regime_data
+    return X, y_reg, y_cls, feat_cols_final, dates, regime_data, latest
 
 
 
@@ -477,6 +494,12 @@ def select_features(X_train, y_train, feat_cols, max_features=25, task="classifi
     return X_train[:, selected_idx], top_features, selected_idx, perm, imp_order
 
 
+def top_feature_indices(X_train, y_train, feat_cols, task, max_features=25):
+    """Column indices of the top features for one type of target."""
+    _, _, idx, _, _ = select_features(X_train, y_train, feat_cols, max_features=max_features, task=task)
+    return list(idx)
+
+
 # ============================================================
 # REGRESSION MODELS
 # ============================================================
@@ -501,7 +524,7 @@ def train_regressors(X_train, y_train, X_test, y_test):
     models = get_regressors()
     results = {}
     best_name = ""
-    best_r2 = -float("inf")
+    best_cv_r2 = -float("inf")
 
     print(f"\n  {'Model':<18s} {'Train R²':>10s} {'Test R²':>10s} {'CV R²':>10s} {'Dir Acc':>9s}")
     print(f"  {'-'*60}")
@@ -536,13 +559,14 @@ def train_regressors(X_train, y_train, X_test, y_test):
             "profit_factor": risk["profit_factor"],
         }
         marker = ""
-        if test_r2 > best_r2:
-            best_r2 = test_r2
+        # Pick by cross-validated R², not the test-set R²
+        if cv_mean > best_cv_r2:
+            best_cv_r2 = cv_mean
             best_name = name
             marker = " ★"
         print(f"  {name:<18s} {train_r2:>10.4f} {test_r2:>10.4f} {cv_mean:>10.4f} {dir_acc:>8.1%}{marker}")
 
-    print(f"  Best regressor: {best_name} (Test R²={best_r2:.4f})")
+    print(f"  Best regressor: {best_name} (CV R²={best_cv_r2:.4f})")
     return results, best_name
 
 
@@ -569,9 +593,9 @@ def train_classifiers(X_train, y_train, X_test, y_test):
     results = {}
     trained = {}
     best_name = ""
-    # v9 fix: Use AUC instead of accuracy for model selection
-    # Accuracy is misleading with imbalanced class distributions
-    best_auc = 0.0
+    # Model selection uses cross-validated AUC on the training window only.
+    # Test-set metrics are reported below but never used to pick the model.
+    best_cv_auc = 0.0
 
     print(f"\n  {'Model':<20s} {'Acc':>7s} {'Prec':>7s} {'Rec':>7s} {'F1':>7s} {'AUC':>7s} {'CV':>7s}")
     print(f"  {'-'*60}")
@@ -613,14 +637,14 @@ def train_classifiers(X_train, y_train, X_test, y_test):
             "y_pred": y_pred, "y_prob": y_prob,
         }
         marker = ""
-        # v9: Select best model by AUC (more robust than accuracy for imbalanced data)
-        if auc > best_auc:
-            best_auc = auc
+        # Pick by cross-validated AUC, not the test-set AUC
+        if cv_auc_mean > best_cv_auc:
+            best_cv_auc = cv_auc_mean
             best_name = name
             marker = " ★"
         print(f"  {name:<20s} {acc:>6.1%} {prec:>6.1%} {rec:>6.1%} {f1:>6.3f} {auc:>6.3f} {cv_mean:>6.1%}{marker}")
 
-    print(f"  Best classifier: {best_name} (AUC={best_auc:.3f})")
+    print(f"  Best classifier: {best_name} (CV-AUC={best_cv_auc:.3f})")
     return results, trained, best_name
 
 
@@ -756,9 +780,50 @@ def regime_analysis(y_prob, y_test, vix_test, ma200_test, model_name, prob_thres
     return best_cfg
 
 
+def evaluate_regime_config(cfg, y_prob, y_test, vix_test, ma200_test):
+    """Apply a filter chosen on validation data to the test window, once."""
+    if cfg is None:
+        print("  No filter met the minimum trade count on validation; nothing to test.")
+        return None
+    pt = cfg["prob_threshold"]
+    tm = (y_prob > pt) | (y_prob < (1 - pt))
+    if cfg["type"] in ("vix", "vix+ma200"):
+        tm = tm & (vix_test < cfg["vix_threshold"])
+    if cfg["type"] in ("ma200", "vix+ma200"):
+        tm = tm & ma200_test.astype(bool)
+    n = int(tm.sum())
+    if n == 0:
+        print("  Test window: the validation-selected filter takes no trades.")
+        return None
+    wr = float(((y_prob[tm] > 0.5).astype(int) == y_test[tm]).mean())
+    print(f"  Test window with validation-selected filter: Win Rate={wr:.1%} | Trades={n}")
+    return {"win_rate": wr, "n_trades": n}
+
+
+def validation_probabilities(model_name, X_train, y_train, val_frac=0.2):
+    """Out-of-sample P(UP) for the last val_frac of the training window.
+
+    The model is refit on the earlier part only, so its predictions on the
+    validation block never used those labels. Returns (probs, validation_start).
+    """
+    cut = int(len(X_train) * (1 - val_frac))
+    template = get_classifiers()[model_name]
+    m = type(template)(**template.get_params())
+    m.fit(X_train[:cut], y_train[:cut])
+    return m.predict_proba(X_train[cut:])[:, 1], cut
+
+
 # ============================================================
 # ENSEMBLE
 # ============================================================
+def ensemble_weights(results):
+    """Soft-voting weight per model: (CV-AUC - 0.5)^2, floored at 0.01. Never uses test data."""
+    return {
+        name: max(0.01, (res.get("cv_auc_mean", 0.5) - 0.5) ** 2)
+        for name, res in results.items()
+    }
+
+
 def build_ensemble(results, y_test):
     """Soft voting ensemble weighted by CV AUC score.
 
@@ -769,10 +834,10 @@ def build_ensemble(results, y_test):
     print(f"\n  --- Ensemble (Soft Voting) ---")
     ens_prob = np.zeros(len(y_test))
     w_total = 0
+    weights = ensemble_weights(results)
     for name, res in results.items():
-        # v9: Use CV-AUC for weighting (no test-set leakage)
         cv_auc = res.get("cv_auc_mean", 0.5)
-        w = max(0.01, (cv_auc - 0.5) ** 2)  # Squared to emphasize better models
+        w = weights[name]
         ens_prob += w * res["y_prob"]
         w_total += w
         print(f"    {name}: CV-AUC={cv_auc:.3f}, weight={w:.4f}")
@@ -1022,20 +1087,18 @@ def create_plots(reg_results, clf_results, best_clf_name, ens_prob, y_test, date
         ax.legend(fontsize=7)
         ax.grid(axis="y", alpha=0.3)
 
-    # 8. Cumulative returns
+    # 8. Cumulative returns: ensemble direction vs buy & hold
     ax = axes[2, 1]
-    if reg_results and ens_prob is not None and len(ens_prob) > 0:
-        best_reg = max(reg_results, key=lambda k: reg_results[k]["test_r2"])
-        # Use best regression model's direction
-        # We don't have predictions stored, so use ensemble
-        # v8: Fix return calculation — use proper pct_change
-        daily_returns = np.diff(prices_test) / prices_test[:-1]
-        daily_returns = np.insert(daily_returns, 0, 0)  # First day = 0 return
-        ens_returns = np.where(ens_prob > 0.5, 1, -1) * daily_returns
+    if ens_prob is not None and len(ens_prob) > 1:
+        # fwd[i] = return from day i to day i+1, i.e. the move the day-i signal predicts.
+        # (Using the return that ends on day i would let the signal see its own outcome.)
+        fwd = np.diff(prices_test) / prices_test[:-1]
+        n = len(fwd)
+        ens_returns = np.where(ens_prob[:n] > 0.5, 1, -1) * fwd
         cum = np.cumprod(1 + ens_returns) - 1
-        bh = np.cumprod(1 + daily_returns) - 1
-        ax.plot(range(len(cum)), cum * 100, "b-", lw=1.5, label="Strategy")
-        ax.plot(range(len(bh)), bh * 100, "r--", lw=1, label="Buy & Hold")
+        bh = np.cumprod(1 + fwd) - 1
+        ax.plot(range(n), cum * 100, "b-", lw=1.5, label="Strategy")
+        ax.plot(range(n), bh * 100, "r--", lw=1, label="Buy & Hold")
         ax.set_title("Cumulative Returns %", fontweight="bold")
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)
@@ -1065,8 +1128,20 @@ def create_plots(reg_results, clf_results, best_clf_name, ens_prob, y_test, date
 # ============================================================
 # NEXT-DAY PREDICTION
 # ============================================================
-def predict_next_day(clf_results, ens_prob, dates, prices, regime_data, target_name, y_test):
-    """Generate next-day prediction."""
+def predict_next_day(trained_clf, clf_results, X_latest, latest, target_name, y_test):
+    """Next-day forecast from the most recent close.
+
+    The latest date's features have no target yet, so they are predicted
+    directly. (The previous version used the last test-set row, which is
+    already one day in the past.)
+    """
+    if X_latest is None:
+        print("  ERROR: latest feature row has missing values; no next-day forecast.")
+        return None
+
+    prices = latest["prices"]
+    dates = latest["dates"]
+
     print(f"\n{'='*60}")
     print(f"  🔮 NEXT-DAY PREDICTION FOR {target_name}")
     print(f"{'='*60}")
@@ -1082,15 +1157,17 @@ def predict_next_day(clf_results, ens_prob, dates, prices, regime_data, target_n
         r = (prices[i] / prices[i-1] - 1) * 100
         print(f"    {dates[i].date()}: {prices[i]:.2f} ({r:+.2f}%)")
 
-    # Model predictions
+    # Model predictions for the latest feature row
+    probs = {name: float(model.predict_proba(X_latest)[0, 1]) for name, model in trained_clf.items()}
     print(f"\n  Model predictions:")
-    for name, res in clf_results.items():
-        p = res["y_prob"][-1]
+    for name in clf_results:
+        p = probs[name]
         d = "UP ↑" if p > 0.5 else "DOWN ↓"
         c = max(p, 1 - p)
         print(f"    {name:<20s}: {d} (P={p:.3f}, conf={c:.1%})")
 
-    ens_p = ens_prob[-1]
+    weights = ensemble_weights(clf_results)
+    ens_p = sum(weights[n] * probs[n] for n in probs) / sum(weights[n] for n in probs)
     ens_d = "UP ↑" if ens_p > 0.5 else "DOWN ↓"
     ens_c = max(ens_p, 1 - ens_p)
     print(f"    {'ENSEMBLE':<20s}: {ens_d} (P={ens_p:.3f}, conf={ens_c:.1%})")
@@ -1150,7 +1227,7 @@ def main():
         return
 
     # Feature engineering
-    X, y_reg, y_cls, feat_cols, dates, regime_data = engineer_features(data, target_col, feature_cols)
+    X, y_reg, y_cls, feat_cols, dates, regime_data, latest = engineer_features(data, target_col, feature_cols)
 
     # v8: Replace inf/-inf with NaN, then drop rows with NaN
     X = np.where(np.isinf(X), np.nan, X)
@@ -1172,23 +1249,34 @@ def main():
     y_reg_train, y_reg_test = y_reg[:split_idx], y_reg[split_idx:]
     y_cls_train, y_cls_test = y_cls[:split_idx], y_cls[split_idx:]
 
-    # Regime data for test
+    # Regime data for the train window (validation filter selection) and the test window
+    vix_train = regime_data["vix_level"][:split_idx] if regime_data["vix_level"] is not None else None
+    ma200_train = regime_data["above_ma200"][:split_idx]
     vix_test = regime_data["vix_level"][split_idx:] if regime_data["vix_level"] is not None else None
     ma200_test = regime_data["above_ma200"][split_idx:]
     dates_test = dates[split_idx:]
     prices_test = regime_data["prices"][split_idx:]
 
-    # Feature selection
-    task = "classification" if mode in ("2", "4") else "both"
-    X_train_sel, sel_feat, sel_idx, perm, imp_order = select_features(
-        X_train_raw, y_cls_train, feat_cols, max_features=25, task=task
-    )
+    # Feature selection: rank features against the target the chosen models predict
+    if mode == "1":
+        sel_idx = top_feature_indices(X_train_raw, y_reg_train, feat_cols, "regression")
+    elif mode in ("2", "4"):
+        sel_idx = top_feature_indices(X_train_raw, y_cls_train, feat_cols, "classification")
+    else:
+        # Mode 3 trains both kinds of model on one feature set: keep the union of both rankings
+        sel_idx = sorted(
+            set(top_feature_indices(X_train_raw, y_reg_train, feat_cols, "regression"))
+            | set(top_feature_indices(X_train_raw, y_cls_train, feat_cols, "classification"))
+        )
+    sel_feat = [feat_cols[i] for i in sel_idx]
+    X_train_sel = X_train_raw[:, sel_idx]
     X_test_sel = X_test_raw[:, sel_idx]
 
     # Scale
     scaler = RobustScaler()
     X_train = scaler.fit_transform(X_train_sel)
     X_test = scaler.transform(X_test_sel)
+    X_latest = scaler.transform(latest["X"][:, sel_idx]) if latest["X"] is not None else None
 
     print(f"\n  Train: {len(X_train)} | Test: {len(X_test)} | Features: {len(sel_feat)}")
 
@@ -1239,10 +1327,17 @@ def main():
         print(f"\n  --- Ensemble Threshold ---")
         threshold_analysis(ens_prob, y_cls_test, "Ensemble")
 
-        # Regime analysis
+        # Regime filter: choose it on validation predictions from the training window,
+        # then check that one filter once on the test window.
         best_regime_cfg = None
         if mode == "3":
-            best_regime_cfg = regime_analysis(best_prob, y_cls_test, vix_test, ma200_test, best_clf_name)
+            val_prob, val_start = validation_probabilities(best_clf_name, X_train, y_cls_train)
+            val_vix = vix_train[val_start:] if vix_train is not None else None
+            best_regime_cfg = regime_analysis(
+                val_prob, y_cls_train[val_start:], val_vix, ma200_train[val_start:],
+                f"{best_clf_name}, validation"
+            )
+            evaluate_regime_config(best_regime_cfg, best_prob, y_cls_test, vix_test, ma200_test)
 
         # Walk-forward (raw/unscaled data — walk_forward_validation scales internally per fold)
         print(f"\n  Walk-Forward (Classification):")
@@ -1253,7 +1348,7 @@ def main():
         )
 
         # Next-day prediction
-        predict_next_day(clf_results, ens_prob, dates, regime_data["prices"], regime_data, target_symbol, y_cls_test)
+        predict_next_day(trained_clf, clf_results, X_latest, latest, target_symbol, y_cls_test)
 
     # ==================== PLOTS ====================
     if mode != "4":
